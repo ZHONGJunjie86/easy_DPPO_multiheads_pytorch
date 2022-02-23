@@ -1,1 +1,1 @@
-# simple_DPPO_multiheads
+# easy_DPPO_multiheads_pytorch
