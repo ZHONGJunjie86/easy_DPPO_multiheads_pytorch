@@ -346,7 +346,7 @@ if __name__ == '__main__':
     parser.add_argument('--tau', default=0.01, type=float)  # 0.005
     parser.add_argument('--gamma', default=0.99, type=float)  # 0.95
     parser.add_argument('--seed', default=1, type=int)
-    parser.add_argument('--a_lr', default=0.0001, type=float)  # 0.0001
+    parser.add_argument('--a_lr', default=0.0003, type=float)  # 0.0001
     parser.add_argument('--c_lr', default=0.0001, type=float)  # 0.0003
     parser.add_argument('--batch_size', default=512,
                         type=int)  # 32768  16384 8192 4096
@@ -387,7 +387,7 @@ if __name__ == '__main__':
     model_share = manager.PPO_Copy(args, main_device)
 
     # 定义保存路径
-    model_enemy_path = "/home/j-zhong/work_place/TD3_SAC_PPO_multi_Python/rl_trainer/models/snakes_3v3/run4/trained_model/enemy.pth"
+    model_enemy_path = "/home/j-zhong/work_place/TD3_SAC_PPO_multi_Python/rl_trainer/models/snakes_3v3/run5/trained_model/enemy.pth"
     run_dir, log_dir = make_logpath(args.game_name, args.algo)
     if args.load_model:  # False:#True:#
         load_dir = os.path.join(os.path.dirname(
@@ -404,7 +404,7 @@ if __name__ == '__main__':
     shared_grad_buffer = Shared_grad_buffers(model_share.get_actor(), main_device)
 
     processes = []
-    K_epochs = 3
+    K_epochs = 4
 
     for rank in range(args.processes):  # rank 编号
         if rank < args.processes*0.4 or rank==0:
