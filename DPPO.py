@@ -8,8 +8,6 @@ from pathlib import Path
 import sys
 base_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(base_dir))
-from replay_buffer import ReplayBuffer
-from common import soft_update, hard_update
 import torch.nn.functional as F
 
 from torch.distributions import Normal #Multivariate
@@ -30,7 +28,7 @@ class Memory:
         self.rewards = []
         self.is_terminals = []
         self.hidden_state = []
-        self.step = []
+        self.num_vectors = []
         self.value = []
     
     def clear_memory(self):
@@ -40,157 +38,74 @@ class Memory:
         del self.rewards[:]
         del self.is_terminals[:]
         del self.hidden_state[:]
-        del self.step[:]
+        del self.num_vectors[:]
         del self.value[:]
 
 class Actor(nn.Module):
     def __init__(self):  #(n+2p-f)/s + 1 
         super(Actor, self).__init__()
-        self.conv1 = nn.Conv2d(4,16, kernel_size=(6,3), stride=1, padding=1) # 20104 -> 20104
-        self.conv2 = nn.Conv2d(16,16, kernel_size=(6,3), stride=1, padding=1) # 20104 -> 20104
-        self.conv3 = nn.Conv2d(16,16, kernel_size=(6,3), stride=1, padding=1) # 20104 -> 20104
-        self.conv4 = nn.Conv2d(16,8, kernel_size=(6,3), stride=1, padding=1) # 20104 -> 20104
-        #self.self_attention = nn.MultiheadAttention(642, 2)
+        self.conv1 = nn.Conv2d(4,16, kernel_size=3, stride=1, padding=1) # 30 -> 15
+        self.maxp1 = nn.MaxPool2d(4, stride=2 , padding= 1)
+        self.conv2 = nn.Conv2d(16,16, kernel_size=4, stride=1, padding=0) # 15 -> 12
+        self.conv3 = nn.Conv2d(16,8, kernel_size=4, stride=1, padding=0) # 12 -> 9
+        self.self_attention = nn.MultiheadAttention(652, 4)
 
-        self.gru = nn.GRU(642, 64, 1) 
+        self.gru = nn.GRU(652, 64, 1) 
         self.critic_linear = nn.Linear(64, 1)
-        self.linear = nn.Linear(64, 12)
-        # self.linear_1 = nn.Linear(64, 4)
-        # self.linear_2 = nn.Linear(64, 4)
-        # self.linear_3 = nn.Linear(64, 4)
-        #
-        #self.soft_max = nn.Softmax(dim=-1)
-        self.Categorical = torch.distributions.Categorical
+        self.linear_mu = nn.Linear(64, 2)
+        self.linear_sigma = nn.Linear(64, 2)
 
-    def forward(self, tensor_cv, step, h_old, old_action = None): #,batch_size
+        self.normal =  torch.distributions.Normal
+        self.num_vector_length = 4
+
+    def forward(self, tensor_cv, num_vector, h_old,  old_action = None): #,batch_size
         # CV
         self.batch_size = tensor_cv.size()[0]
         i_1 = tensor_cv
         # CV
-        x = F.relu(self.conv1(i_1))
+        x = F.relu(self.maxp1(self.conv1(i_1)))
         #i_2 = i_1 + x
         x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x)).reshape(1,self.batch_size,640)#(1,self.batch_size,640)
+        x = F.relu(self.conv3(x)).reshape(1,self.batch_size,648)#(1,self.batch_size,640)
         
-
-        step = step.reshape(1,self.batch_size,2)
+        step = num_vector.reshape(1,self.batch_size,self.num_vector_length)
 
         x = torch.cat([x, step], -1)
-        #x = self.self_attention(x,x,x)[0] + x
+        x = self.self_attention(x,x,x)[0] + x
         x,h_state = self.gru(x, h_old)
-        #h_state = torch.zeros(1,1,64)
         
         value = self.critic_linear(x)
-        #y.detach()
-        #x = x.reshape(self.batch_size,642)
-        x = self.linear(x)
-        # a = self.linear_1(x)
-        # b = self.linear_2(x)
-        # c = self.linear_3(x)
-        #x = torch.stack([a,b,c],1)
-        
-        action_probs = torch.softmax( x.reshape(self.batch_size,3,4) ,dim =-1)
-        z = (action_probs == 0.0).float()*1e-8
-        log_prob = torch.log(action_probs+z)
-        entropy = -torch.sum(action_probs.reshape(self.batch_size,3,4)*log_prob.reshape(self.batch_size,3,4),dim=-1,keepdim=True)
 
-        dis = self.Categorical(action_probs.reshape(self.batch_size*3, 4))
+        #[Box(-100.0, 200.0, (1,), float32), Box(-30.0, 30.0, (1,), float32)]
+        mu = torch.tanh(self.linear_mu(x)).reshape(self.batch_size, 2, 1)
+        sigma = torch.relu(self.linear_sigma(x)).reshape(self.batch_size, 2, 1) + 1e-6
+
+        dist = self.normal(mu,sigma)  
+        entropy = dist.entropy().mean()
+
         if old_action == None:
-            action = dis.sample().reshape(self.batch_size, 3,1)
+            action = dist.sample().reshape(self.batch_size, 2,1)
         else: 
-            action = old_action.reshape(self.batch_size, 3,1)
-        
-        selected_action_probs = action_probs.gather(-1, action)
-        selected_log_prob = log_prob.gather(-1, action) #* selected_action_probs
-         
+            action = old_action.reshape(self.batch_size, 2,1)
+
+        selected_log_prob = dist.log_prob(action)   
         
         return action, selected_log_prob, entropy, h_state.data, value.reshape(self.batch_size,1,1)
 
-class Critic(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.act_dim = 3
-
-        # Q1 architecture
-        self.conv1_1 = nn.Conv2d(4,8, kernel_size=(6,3), stride=1, padding=1) # 20104 -> 17108
-        self.conv2_1 = nn.Conv2d(8,8, kernel_size=(6,3), stride=1, padding=1) # 17108 -> 141016
-        self.conv3_1 = nn.Conv2d(8,8, kernel_size=(6,3), stride=1, padding=1) # 141016-> 111032
-        self.conv4_1 = nn.Conv2d(8,8, kernel_size=(6,3), stride=1, padding=1) # 16632 -> 14464
-        self.self_attention_1 = nn.MultiheadAttention(642, 2)
-        self.linear_1 = nn.Linear(642,1)
-        #self.lstm_1 = nn.LSTM(640,12, 1) 
-        ##########################################
-        # Q2 architecture
-        self.conv1_2 = nn.Conv2d(4,8, kernel_size=(6,3), stride=1, padding=1) # 20104 -> 17108
-        self.conv2_2 = nn.Conv2d(8,8, kernel_size=(6,3), stride=1, padding=1) # 17108 -> 141016
-        self.conv3_2 = nn.Conv2d(8,8, kernel_size=(6,3), stride=1, padding=1) # 141016-> 111032
-        self.conv4_2 = nn.Conv2d(8,8, kernel_size=(6,3), stride=1, padding=1) # 16632 -> 14464
-        self.self_attention_2 = nn.MultiheadAttention(642, 2)
-        self.linear_2 = nn.Linear(642,1)
-
-    def forward(self, tensor_cv, step):
-        # CV
-        batch_size = tensor_cv.size()[0]
-        i = tensor_cv
-        x = F.relu(self.conv1_1(i))
-        x = F.relu(self.conv2_1(x))
-        x = F.relu(self.conv3_1(x))
-        x = F.relu(self.conv4_1(x))
-        #
-        x=  x.reshape(1,batch_size,640)
-
-        step = step.reshape(1,batch_size,2)
-        x = torch.cat([x, step], -1)
-        #x = self.self_attention_1(x,x,x)[0] + x
-        x = x.reshape(batch_size,642)
-
-        out_1 = torch.tanh(self.linear_1(x)).reshape(batch_size,1,1)
-
-        ###################################################################
-        # CV
-        i = tensor_cv
-        x = F.relu(self.conv1_2(i))
-        #i = i + x
-        x = F.relu(self.conv2_2(x))
-        x = F.relu(self.conv3_2(x))
-        x = F.relu(self.conv4_2(x))
-        #
-        x =  x.reshape(1,batch_size,640)
-        
-
-        step = step.reshape(1,batch_size,2)
-        x = torch.cat([x, step], -1)
-        #x = self.self_attention_2(x,x,x)[0] + x
-        x = x.reshape(batch_size,642)
-
-        out_2 = torch.tanh(self.linear_2(x)).reshape(batch_size,1,1)
-
-       
-        return out_1,out_2 
 
 class PPO:
     def __init__(self,  args, device):
         self.device = device
         self.a_lr = args.a_lr
-        self.c_lr = args.c_lr
-        self.batch_size = args.batch_size
         self.gamma = args.gamma
-        self.tau = args.tau
-        self.model_episode = args.model_episode
-        self.eps = args.epsilon
-        self.decay_speed = args.epsilon_speed
-        self.output_activation = args.output_activation
 
-        # Initialise actor network and critic network with ξ and θ
+        # Initialise actor network 
         self.actor = Actor().to(self.device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=self.a_lr)
-        self.critic = Critic().to(self.device)
-        #self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=self.c_lr)
         self.SmoothL1Loss = torch.nn.SmoothL1Loss()
 
         #
-        self.memory = Memory()
+        self.memory_our_enemy = [Memory(), Memory()]
         self.hidden_state = torch.zeros(1,1,64).to(self.device)
         #
         self.c_loss = 0
@@ -199,107 +114,125 @@ class PPO:
         self.eps_clip = 0.1
         self.vf_clip_param = 0.5
         self.lam = 0.95
-        self.batch_sample = 60
+        self.K_epochs = args.K_epochs
         self.old_value_1, self.old_value_2 = 0,0
-        
         
         #
         self.shared_loss = 0
         self.loss_dic = [0,0]
         self.advantages = []
         self.target_value = []
+        self.num_vector_length = 4
 
     # Random process N using epsilon greedy
-    def choose_action(self, obs, step, evaluation=False):
-        self.memory.states.append(obs)
-        step = torch.tensor(step, device = self.device) #np.full(1, step/100)
-        obs = torch.Tensor([obs]).to(self.device)
-        if len(self.memory.hidden_state)==0:
-            self.memory.hidden_state.append(self.hidden_state.cpu().detach().numpy())
+    def choose_action(self, obs, num_vector, our_turn = False):
+        memery_index = 0 if our_turn else 1
 
-        action,action_logprob,_,self.hidden_state, value = self.actor(obs, step, self.hidden_state)
+        self.memory_our_enemy[memery_index].states.append(obs)
+        num_vector = torch.tensor(num_vector, device = self.device) #np.full(1, step/100)
+        obs = torch.Tensor(obs).to(self.device).reshape(1,4,30,30)
+        if len(self.memory_our_enemy[memery_index].hidden_state)==0:
+            self.memory_our_enemy[memery_index].hidden_state.append(self.hidden_state.cpu().detach().numpy())
 
-        self.memory.actions.append(action.cpu().detach().numpy())
-        self.memory.logprobs.append(action_logprob.cpu().detach().numpy()) #[0]
-        self.memory.hidden_state.append(self.hidden_state.cpu().detach().numpy())
-        self.memory.step.append(step.cpu().detach().numpy())
-        self.memory.value.append(value.cpu().detach().numpy())
-        return action.reshape(1,3).cpu().detach().numpy()[0]
+        action,action_logprob,_,self.hidden_state, value = self.actor(obs, num_vector, self.hidden_state)
+        
+        self.memory_our_enemy[memery_index].actions.append(action.cpu().detach().numpy())
+        self.memory_our_enemy[memery_index].logprobs.append(action_logprob.cpu().detach().numpy()) #[0]
+        self.memory_our_enemy[memery_index].hidden_state.append(self.hidden_state.cpu().detach().numpy())
+        self.memory_our_enemy[memery_index].num_vectors.append(num_vector.cpu().detach().numpy())
+        self.memory_our_enemy[memery_index].value.append(value.cpu().detach().numpy())
+        return action.reshape(1,2).cpu().detach().numpy()[0]
 
 
     def compute_GAE(self, training_time, main_process = False):
-        batch_size = len(self.memory.actions)
-        old_states = torch.tensor(self.memory.states).reshape(batch_size,4,20,10).to(self.device).detach() #torch.squeeze(, 1)
-        old_logprobs = torch.tensor(self.memory.logprobs).reshape(batch_size,3,1).to(self.device).detach()
-        old_actions = torch.tensor(self.memory.actions).reshape(batch_size,3,1).to(self.device).detach()
-        #old_logprobs = old_logprobs.gather(-1,old_actions.long()) 
-
-        old_hidden = torch.tensor(self.memory.hidden_state[:-1]).reshape(1,batch_size,64).to(self.device).detach()
-        old_step = torch.tensor(self.memory.step).reshape(1,batch_size,2).to(self.device).detach()
-        old_value = torch.tensor(self.memory.value).reshape(batch_size, 1, 1).to(self.device).detach()
-
-
+        
         if training_time ==0:
-            #state_values_1,state_values_2 = self.critic(old_states, old_step)
-            self.old_value_1 = old_value
+            batch_size_1 = torch.tensor(self.memory_our_enemy[0].logprobs).view(-1, 2, 1).size()[0]
+            batch_size_2 = torch.tensor(self.memory_our_enemy[1].logprobs).view(-1, 2, 1).size()[0]
+            self.old_states = torch.cat( 
+                            [torch.tensor(self.memory_our_enemy[0].states).view(-1,4,30,30),
+                            torch.tensor(self.memory_our_enemy[1].states).view(-1,4,30,30)
+                            ], 0).to(self.device).detach() 
+            self.old_logprobs = torch.cat(
+                            [torch.tensor(self.memory_our_enemy[0].logprobs).view(-1, 2, 1),
+                            torch.tensor(self.memory_our_enemy[1].logprobs).view(-1, 2, 1)
+                            ], 0).to(self.device).detach()
+            self.old_actions = torch.cat( 
+                            [torch.tensor(self.memory_our_enemy[0].actions).view(-1, 2, 1),
+                            torch.tensor(self.memory_our_enemy[1].actions).view(-1, 2, 1)
+                            ], 0).to(self.device).detach() 
 
+            self.old_num_vector = torch.cat(
+                            [torch.tensor(self.memory_our_enemy[0].num_vectors).view( -1,1, self.num_vector_length),
+                            torch.tensor(self.memory_our_enemy[1].num_vectors).view(-1,1, self.num_vector_length)
+                            ], 0).to(self.device).detach() 
+            self.old_value = torch.cat(
+                            [torch.tensor(self.memory_our_enemy[0].value).view(-1, 1, 1),
+                            torch.tensor(self.memory_our_enemy[1].value).view(-1, 1, 1)
+                            ], 0).to(self.device).detach()    
+            self.old_hidden = torch.cat( 
+                            [torch.tensor(self.memory_our_enemy[0].hidden_state[:-1]).view(-1, 1, 64),
+                            torch.tensor(self.memory_our_enemy[1].hidden_state[:-1]).view(-1, 1, 64)
+                            ], 0).to(self.device).detach() 
+            compute_rewards = torch.cat( 
+                            [torch.tensor(self.memory_our_enemy[0].rewards).view(-1, 1, 1),
+                            torch.tensor(self.memory_our_enemy[1].rewards).view(-1, 1, 1)
+                            ], 0).to(self.device).detach() 
+            compute_termi = torch.cat( 
+                            [torch.tensor(self.memory_our_enemy[0].is_terminals).view(-1, 1, 1)[-batch_size_1:],
+                            torch.tensor(self.memory_our_enemy[1].is_terminals).view(-1, 1, 1)[-batch_size_2:]
+                            ], 0).to(self.device).detach()
             # Monte Carlo estimate of rewards:
             rewards = []
             GAE_advantage = []
             target_value = []
             #
-            discounted_reward = 0#np.minimum(last_state_values_1[0].cpu().detach().numpy(),
-                                #last_state_values_1[0].cpu().detach().numpy() )
-            values_pre = 0#np.minimum(last_state_values_1[0].cpu().detach().numpy(),
-                        #      last_state_values_1[0].cpu().detach().numpy() )
+            discounted_reward = 0
+            values_pre = 0
             advatage = 0
-            for reward, is_terminal,values_1,values_2 in zip(reversed(self.memory.rewards), reversed(self.memory.is_terminals),
-                                        reversed(self.old_value_1),reversed(self.old_value_1)): #反转迭代
+
+            for reward, is_terminal,values in zip(reversed(compute_rewards), reversed(compute_termi),
+                                        reversed(self.old_value)): #反转迭代
+                
+                values = values.cpu().detach().numpy()
+                reward = reward.cpu().detach().numpy()
+                is_terminal = is_terminal.cpu().detach().numpy()
 
                 discounted_reward = reward +  self.gamma *discounted_reward 
                 rewards.insert(0, discounted_reward) #插入列表
 
-                values_1,values_2 = values_1.cpu().detach().numpy(),values_2.cpu().detach().numpy()
-                #values = (values_1+values_2)/2
-                values =values_1#
-                #values = np.maximum(values_1,values_2)
                 
-                #delta = reward + values_pre - values
-                #delta = discounted_reward - values 
-                delta = reward + self.gamma*values_pre - values  #(1-is_terminal)*
-                advatage = delta + self.gamma*self.lam*advatage 
+                delta = reward + (1-is_terminal)*self.gamma*values_pre - values  
+                advatage = delta + self.gamma*self.lam*advatage * (1-is_terminal)
                 GAE_advantage.insert(0, advatage) #插入列表
-                target_value.insert(0,float(values + advatage))#insert(0,float(reward + values_pre))
+                target_value.insert(0,float(values + advatage))
                 values_pre = values
-                #values_pre = np.minimum(values_1,values_2)
             
             # Normalizing the rewards:
-            rewards = torch.tensor(rewards).to(self.device).reshape(batch_size,1,1)
-            self.target_value = torch.tensor(target_value).to(self.device).reshape(batch_size,1,1)
-            GAE_advantage = torch.tensor(GAE_advantage).to(self.device).reshape(batch_size,1,1)
+            rewards = torch.tensor(rewards).to(self.device).view(-1,1,1)
+            self.target_value = torch.tensor(target_value).to(self.device).view(-1,1,1)
+            GAE_advantage = torch.tensor(GAE_advantage).to(self.device).view(-1,1,1)
             self.advantages = (GAE_advantage- GAE_advantage.mean()) / (GAE_advantage.std() + 1e-6) 
             
-            #GAE_advantage#
-
         #compute
-        indices = torch.randint(batch_size, size=(self.batch_sample,), requires_grad=False)#, device=self.device
+        batch_size = self.target_value.size()[0]
+        batch_sample = int(batch_size / self.K_epochs)
+        indices = torch.randint(batch_size, size=(batch_sample,), requires_grad=False)#, device=self.device
 
-        old_states = old_states[indices]
-        old_step = old_step.reshape(batch_size,1,2)[indices].reshape(1,self.batch_sample, 2)
-        old_hidden = old_hidden.reshape(batch_size,1,64)[indices].reshape(1,self.batch_sample, 64)
-        old_actions = old_actions[indices]
-        old_logprobs = old_logprobs[indices]
+        old_states = self.old_states[indices]
+        old_num_vector = self.old_num_vector.reshape(batch_size,1,self.num_vector_length)[indices].view(1,-1, self.num_vector_length)
+        old_hidden = self.old_hidden.reshape(batch_size,1,64)[indices].view(1,-1, 64)
+        old_actions = self.old_actions[indices]
+        old_logprobs = self.old_logprobs[indices]
         advantages = self.advantages[indices].detach()
-        old_value = self.old_value_1[indices]
+        old_value = self.old_value[indices]
         target_value = self.target_value[indices]
 
-        _, logprobs, dist_entropy, _, value = self.actor(old_states, old_step, old_hidden, old_actions)
- 
-        #state_values_1,state_values_2 = self.critic(old_states, old_step)
-        #value = state_values_1
 
-        ratios = torch.exp(logprobs.reshape(self.batch_sample,3,1).sum(1,keepdim = True) - 
-                           old_logprobs.reshape(self.batch_sample,3,1).sum(1,keepdim = True).detach())
+        _, logprobs, dist_entropy, _, value = self.actor(old_states, old_num_vector, old_hidden, old_actions)
+ 
+        ratios = torch.exp(logprobs.view(-1,2,1).sum(1,keepdim = True) - 
+                           old_logprobs.view(-1,2,1).sum(1,keepdim = True).detach())
 
         surr1 = ratios*advantages
         surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip)*advantages 
@@ -312,13 +245,10 @@ class PPO:
         critic_loss1 = (value - target_value.detach()).pow(2)
         critic_loss2 = (value_pred_clip - target_value.detach()).pow(2)
         critic_loss = 0.5 * torch.max(critic_loss1 , critic_loss2).mean()
-        
-        #critic_loss = (torch.nn.SmoothL1Loss()(state_values_1, rewards[indices]))/(rewards[indices].std() + 1e-6) 
         #critic_loss = torch.nn.SmoothL1Loss()(state_values_1, target_value) + torch.nn.SmoothL1Loss()(state_values_2, target_value)
 
-        actor_loss = -surr3.mean() - 0.02*dist_entropy.mean() + 0.5 * critic_loss
+        actor_loss = -surr3.mean() - 0.02*dist_entropy + 0.5 * critic_loss
         
-
         # do the back-propagation...
         self.actor.zero_grad()
         actor_loss.backward()
@@ -352,19 +282,17 @@ class PPO:
 
     def get_actor(self):
         return self.actor
-    
-    def get_critic(self):
-        return self.critic
 
     def reset_loss(self):
         self.a_loss = 0
         self.c_loss = 0
 
     def copy_memory(self, sample_mem):
-        self.memory = sample_mem
+        self.memory_our_enemy = sample_mem
     
     def clear_memory(self):
-        self.memory.clear_memory()
+        self.memory_our_enemy[0].clear_memory()
+        self.memory_our_enemy[1].clear_memory()
 
     def load_model(self, run_dir, episode):
         print(f'\nBegin to load model: ')
@@ -372,15 +300,11 @@ class PPO:
         print("base_path",base_path)
 
         model_actor_path = os.path.join(base_path, "actor_"  + ".pth")
-        model_critic_path = os.path.join(base_path, "critic_"  + ".pth")
         print(f'Actor path: {model_actor_path}')
-        print(f'Critic path: {model_critic_path}')
 
-        if os.path.exists(model_critic_path) and os.path.exists(model_actor_path):
+        if  os.path.exists(model_actor_path):
             actor = torch.load(model_actor_path, map_location=self.device)
-            critic = torch.load(model_critic_path, map_location=self.device)
             self.actor.load_state_dict(actor)
-            self.critic.load_state_dict(critic)
             print("Model loaded!")
         else:
             sys.exit(f'Model not founded!')
@@ -395,8 +319,6 @@ class PPO:
         model_actor_path = os.path.join(base_path, "actor_"  + ".pth") #+ str(episode)
         torch.save(self.actor.state_dict(), model_actor_path)
 
-        model_critic_path = os.path.join(base_path, "critic_" + ".pth") #+ str(episode) 
-        torch.save(self.critic.state_dict(), model_critic_path)
 
 
 #this is used to accumulate the gradients

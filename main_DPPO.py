@@ -1,7 +1,14 @@
 import random
+from re import M
+import sys
+from pathlib import Path
+#from torch import manager_path
+base_dir = Path(__file__).resolve().parent.parent
+sys.path.append(str(base_dir))
+
 import torch.multiprocessing as mp
+import torch
 import numpy as np
-from Curve_ import cross_loss_curve
 from log_path import *
 from common import *
 from algo.DPPO import PPO, Shared_grad_buffers
@@ -9,366 +16,285 @@ import argparse
 import datetime
 from matplotlib.pyplot import get
 import os
-import wandb
-from tensorboardX import SummaryWriter
-import sys
-sys.path.append("/home/j-zhong/work_place/TD3_SAC_PPO_multi_Python/")
 from env.chooseenv import make
-from pathlib import Path
 import sys
 import time
 import copy
 
+from collections import deque, namedtuple
+
+import wandb
 from multiprocessing.managers import BaseManager
 class MyManager(BaseManager):
     pass
 
 MyManager.register("PPO_Copy",PPO)
 
-#from torch import manager_path
-base_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(base_dir))
-
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
-cpu_device = torch.device("cpu")
-
 Memory_size = 4
 
 
 def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared_count, event, model_enemy_path,
           shared_model=None, experiment_share_1=None, K_epochs=3, shared_grad_buffer = None):
 
-    if rank == 0:
-        writer = SummaryWriter(str(log_dir))
-        save_config(args, log_dir)
+    
+    print("rank ", rank)
     print(f'device: {device}')
 
     env = make(args.game_name, conf=None)
 
-    ctrl_agent_index = [0, 1, 2]
-    ctrl_agent_num = len(ctrl_agent_index)
-
-    obs_dim = 26
-    width = env.board_width
-    #print(f'Game board width: {width}')
-    height = env.board_height
-
-    if rank == 0:
-        wandb.init(project="my-test-project", entity="zhongjunjie")
-        wandb.config = {
-            "learning_rate": 0.0001,
-            "batch_size": args.batch_size
-        }
-
-    # PPO(obs_dim*Memory_size, act_dim, ctrl_agent_num, args,device)
+    ctrl_agent_index = int(args.controlled_player)
+    
     model = PPO(args, device)
-    model_enemy = PPO(args, device)
+    #model_enemy = PPO(args, device)
 
     model.actor.load_state_dict(
         shared_model.get_actor().state_dict())  # sync with shared model
-    model.critic.load_state_dict(
-        shared_model.get_critic().state_dict())  # sync with shared model
-    model_enemy.actor.load_state_dict(shared_model.get_actor().state_dict())
+    #model_enemy.actor.load_state_dict(shared_model.get_actor().state_dict())
 
-    history_reward = []
-    history_step_reward = []
-    history_a_loss = []
-    history_c_loss = []
     history_success = []
     history_enemy = {}
+    RENDER = args.render #True#
 
     total_step_reward = 0
     c_loss, a_loss = 0, 0
-    step_reward = [0, 0, 0]
+    step_reward = 0
 
     memory = Memory()
     memory_enemy = Memory()
 
-    # torch.manual_seed(args.seed)
 
     episode = 0
     episode_enemy_update = 0
     success = 0
     select_pre = False
+    
+    record_win = deque(maxlen=100)
+    record_win_op = deque(maxlen=100)
+
+    our_turn = False
+    if rank == 0:
+        wandb.config = {
+            "learning_rate": 0.0004,
+        }
+        
+        wandb.init(project="Curling", entity="zhongjunjie")
 
     while episode < args.max_episodes:
 
-        punishiment_lock = [6, 6, 6]
-
-        state = env.reset()
-
-        state_to_training = state[0]
-        obs = visual_ob(state[0])
-        obs_enemy = copy.deepcopy(obs)
-        obs = obs/10
-        obs_enemy = get_enemy_obs(obs_enemy)
-
-        for _ in range(Memory_size):
-            memory.m_obs.append(obs)
-            memory_enemy.m_obs.append(obs_enemy)
-        obs = np.stack(memory.m_obs)
-        obs_enemy = np.stack(memory_enemy.m_obs)
-
         episode += 1
         step = 0
-        episode_reward = np.zeros(6)
+        Gt = 0
+        state = env.reset()
+        if RENDER and rank == 0:
+            env.env_core.render()
+
+        obs = np.array(state[ctrl_agent_index]['obs'])/10
+        obs_enemy = np.array(state[1-ctrl_agent_index]['obs'])/10
+
+        for _ in range(Memory_size):
+            if np.sum(obs) != -90:
+                memory.m_obs.append(obs)
+                our_turn = True
+
+            if np.sum(obs_enemy) != -90:
+                memory_enemy.m_obs.append(obs_enemy)
+                our_turn = False
+
+        if our_turn:
+            obs = np.stack(memory.m_obs)
+        else:obs = np.stack(memory_enemy.m_obs)
 
         while True:
-            num_vector = np.array([np.sum((episode_reward[:3]) - np.sum(episode_reward[3:]))/10,
-                                  step/100])
-            logits = model.choose_action(obs, num_vector )
+            if np.sum(np.array(state[ctrl_agent_index]['obs'])/10) != -90:
+                our_turn = True
+            else: our_turn = False
 
-            #logits_enemy = model_enemy.choose_action(obs_enemy)
-            #actions = np.array([logits , logits_enemy]).reshape(6)
-            actions = logits_AC(state_to_training, logits, height, width)
-
-            next_state, reward, done, _, info = env.step(env.encode(actions))
-            next_state_to_training = next_state[0]
-
-            next_obs = visual_ob(next_state_to_training)
-            next_obs_enemy = copy.deepcopy(next_obs)
-            next_obs_enemy = get_enemy_obs(next_obs_enemy)
-            next_obs = next_obs/10
-
-            # Memory
-            if len(memory.m_obs_next) != 0:
-                del memory.m_obs_next[:1]
-                del memory_enemy.m_obs_next[:1]
-                memory.m_obs_next.append(next_obs)
-                memory_enemy.m_obs_next.append(next_obs_enemy)
+            #TODO another features maybe 
+            num_vector = np.array([
+                                int(state[ctrl_agent_index]['release']), 
+                                state[ctrl_agent_index]["throws left"][0]/10,
+                                state[ctrl_agent_index]["throws left"][1]/10,
+                                int(our_turn)
+                                ])
+            ################################# collect  action #############################
+            if our_turn:
+                action_opponent = [[1], [1]]
             else:
-                memory.m_obs_next = memory.m_obs
-                memory_enemy.m_obs_next = memory_enemy.m_obs
-                memory.m_obs_next[Memory_size-1] = next_obs
-                memory_enemy.m_obs_next[Memory_size-1] = next_obs_enemy
+                action_ctrl = [[1], [1]]
+            action_raw = model.choose_action(obs, num_vector, our_turn)
+            if our_turn:
+                action_ctrl = linear_transformer(action_raw)
+            else:
+                action_opponent = linear_transformer(action_raw)
 
-            next_obs = np.stack(memory.m_obs_next)
-            next_obs_enemy = np.stack(memory_enemy.m_obs_next)
+            action = [action_opponent, action_ctrl] if ctrl_agent_index == 1 else [action_ctrl, action_opponent]
+            
+            # if episode>1:
+            #     print("our_turn",our_turn,"action--------",action)
+            ################################# env rollout ##########################################
+            #self.all_observes, reward, self.done, info_before, info_after
+            next_state, reward, done, _, info = env.step(action)
+
+            next_obs = np.array(next_state[ctrl_agent_index]['obs'])/10
+            next_obs_enemy = np.array(next_state[1-ctrl_agent_index]['obs'])/10
+
+            # stack Memory
+            if np.sum(next_obs) != -90:
+                if len(memory.m_obs_next) == 0:
+                    if len(memory.m_obs) == 0:
+                        for _ in range(Memory_size):
+                            memory.m_obs.append(next_obs)
+                        memory.m_obs_next = copy.deepcopy(memory.m_obs)
+                    else:
+                        memory.m_obs_next = copy.deepcopy(memory.m_obs)
+                        memory.m_obs_next[-1] = next_obs
+                else:
+                    del memory.m_obs_next[:1]
+                    memory.m_obs_next.append(next_obs)
+                our_turn = True
+                next_obs = np.stack(memory.m_obs_next)
+
+            if np.sum(next_obs_enemy) != -90:
+                if len(memory_enemy.m_obs_next) == 0:
+                    if len(memory_enemy.m_obs) == 0:
+                        for _ in range(Memory_size):
+                            memory_enemy.m_obs.append(next_obs_enemy)
+                        memory_enemy.m_obs_next = copy.deepcopy(memory_enemy.m_obs)
+                    else:
+                        memory_enemy.m_obs_next = copy.deepcopy(memory_enemy.m_obs)
+                        memory_enemy.m_obs_next[-1] = next_obs_enemy
+                else:
+                    del memory_enemy.m_obs_next[:1]
+                    memory_enemy.m_obs_next.append(next_obs_enemy)
+
+                our_turn = False
+                next_obs = np.stack(memory_enemy.m_obs_next)
+            
+            
+            step += 1
 
             # ================================== reward shaping ========================================
-            reward = np.array(reward)
-            episode_reward += reward
-            """se:"""
+            #done reward [0.0, 100.0]   post_reward[-100.0, 100.0]           
+            #reward投完暂胜1 一局完10.0 结束100
+            #350.0 距离开始，靠近环90左右
 
-            if done:  # 结束
-                if np.sum(episode_reward[:3]) > np.sum(episode_reward[3:]):  # AI赢
-                    step_reward, enemy_reward = get_reward(
-                        info, ctrl_agent_index, reward, punishiment_lock, score=1)
-                elif np.sum(episode_reward[:3]) < np.sum(episode_reward[3:]):  # random赢
-                    step_reward, enemy_reward = get_reward(
-                        info, ctrl_agent_index, reward, punishiment_lock, score=2)
-                else:  # 一样长
-                    step_reward, enemy_reward = get_reward(
-                        info, ctrl_agent_index, reward, punishiment_lock, score=0)
-            elif np.sum(episode_reward[:3]) > np.sum(episode_reward[3:]):  # AI长
-                step_reward, enemy_reward = get_reward(
-                    info, ctrl_agent_index, reward, punishiment_lock, score=3)
-            elif np.sum(episode_reward[:3]) < np.sum(episode_reward[3:]):  # random长
-                step_reward, enemy_reward = get_reward(
-                    info, ctrl_agent_index, reward, punishiment_lock, score=4)
-            else:  # 一样长
-                step_reward, enemy_reward = get_reward(
-                    info, ctrl_agent_index, reward, punishiment_lock, score=0)
+            #距离奖励
+            step_reward = max( 130 - compute_distance([300, 500], env.env_core.agent_pos[-1]), -20)/1000
+            if our_turn:
+                reward_index = 0
+            else:
+                reward_index = 1
+            
+            model.memory_our_enemy[reward_index].rewards.append(step_reward)
+            #只看距离感觉奖励
+            total_step_reward += step_reward
+            #投完奖励
+            if sum(reward) == 1 or sum(reward) == 10:
+                winner_index = reward.index(1) if sum(reward) == 1 else reward.index(10) 
+                # our index 1
+                model.memory_our_enemy[1-winner_index].rewards[-1] += 1
+                if len(model.memory_our_enemy[winner_index].rewards) != 0:
+                    model.memory_our_enemy[winner_index].rewards[-1] -= 0.5
 
-            total_step_reward += sum(step_reward)
+                model.memory_our_enemy[reward_index].is_terminals.append(0)
+            else: model.memory_our_enemy[reward_index].is_terminals.append(0)
 
-            done = np.array([done] * ctrl_agent_num)
+            #球投完
+            # if sum(reward) == 10:
+            #     if reward[0] != reward[1]:
+            #         post_reward = [reward[0]-100, reward[1]] if reward[0]<reward[1] else [reward[0], reward[1]-100]
+            #     else:
+            #         post_reward=[-1., -1.]
+            
 
-            model.memory.rewards.append(sum(step_reward))
-            model.memory.is_terminals.append(done)
+            if RENDER and rank == 0:
+                env.env_core.render()
+            #?
+            Gt += reward[ctrl_agent_index] if done else 0
 
             # ================================== collect data ========================================
             # Store transition in R
-
+            state = next_state
             obs = next_obs
-            obs_enemy = next_obs_enemy
-            step += 1
-
-            # Training
-            if args.episode_length <= step:
+            #obs_enemy = next_obs_enemy
+            
+            if sum(reward) == 10 or done:#done:
+                model.memory_our_enemy[0].is_terminals.append(1)
+                model.memory_our_enemy[1].is_terminals.append(1)
+                
+                win_is = 1 if reward[ctrl_agent_index]>reward[1-ctrl_agent_index] else 0
+                win_is_op = 1 if reward[ctrl_agent_index]<reward[1-ctrl_agent_index] else 0
+                record_win.append(win_is)
+                record_win_op.append(win_is_op)
                 if rank == 0:
-                    training_time = 0
-                    shared_model.copy_memory(model.memory)
-                    while training_time < K_epochs:
-                        #
-                        a_loss, c_loss = model.compute_GAE(training_time)
+                    print("Episode: ", episode, "controlled agent: ", ctrl_agent_index, "; Episode Return: ", Gt,
+                        "; win rate(controlled & opponent): ", '%.2f' % (sum(record_win)/len(record_win)),
+                        '%.2f' % (sum(record_win_op)/len(record_win_op)))
 
-                        while shared_count.value < args.processes-1:
-                            time.sleep(0.01)
-                        time.sleep(0.01)
-                        #
-                        shared_lock.acquire()
-                        
-                        model.add_gradient(shared_grad_buffer)
 
-                        shared_count.value = 0
-                        shared_lock.release()
-                        #
-                        shared_model.update(copy.deepcopy(shared_grad_buffer.grads), args.processes)
-                        shared_grad_buffer.reset()
+                #writer.add_scalar('training Gt', Gt, episode)
+                # Training
+                a_loss, c_loss = K_epochs_PPO_training(rank, event, 
+                          None, model_enemy_path, model, shared_model,   #model_enemy 暂不用自博弈
+                          shared_count, shared_grad_buffer, shared_lock, 
+                          K_epochs, args, episode, run_dir, device )
 
-                        c_loss, a_loss = model.get_loss()
-                        model.actor.load_state_dict(
-                            shared_model.get_actor().state_dict())
+                model.memory_our_enemy[0].clear_memory()
+                model.memory_our_enemy[1].clear_memory()
 
-                        event.set()
-                        event.clear()
-                        training_time += 1
-
-                    #torch.save(model_enemy.actor.state_dict(), model_enemy_path)
-                    model.reset_loss()
-                    shared_model.clear_memory()
-                    if episode % 20 == 0:
-                        shared_model.save_model(run_dir, episode)
-                else:
-                    training_time = 0
-                    while training_time < K_epochs:
-                        a_loss, c_loss = model.compute_GAE(training_time)
-
-                        shared_lock.acquire()
-
-                        model.add_gradient(shared_grad_buffer)
-
-                        shared_count.value += 1
-                        shared_lock.release()
-
-                        event.wait()
-
-                        model.actor.load_state_dict(
-                            shared_model.get_actor().state_dict())
-
-                        training_time += 1
-
-                    #enemy_temp = torch.load(model_enemy_path , map_location=device)
-                    # model_enemy.load_state_dict(enemy_temp)
-
-                model.memory.clear_memory()
-
-                if np.sum(episode_reward[0:3]) > np.sum(episode_reward[3:]):
+                if win_is:
                     success = 1
                 else:
                     success = 0
                 history_success.append(success)
 
                 if rank == 0:
-                    print(
-                        f'[Episode {episode:05d}] total_reward: {np.sum(episode_reward[0:3]):} rank: {rank:.2f}')
-                    print(
-                        f'[Episode {episode:05d}] Enemy_reward: {np.sum(episode_reward[3:]):}')
-                    print(f'\t\t\t\tsnake_1: {episode_reward[0]} '
-                          f'snake_2: {episode_reward[1]} snake_3: {episode_reward[2]}')
-
-                    reward_tag = 'reward'
-                    loss_tag = 'loss'
-
-                    writer.add_scalars(reward_tag, global_step=episode,
-                                       tag_scalar_dict={'snake_1': episode_reward[0], 'snake_2': episode_reward[1],
-                                                        'snake_3': episode_reward[2], 'total': np.sum(episode_reward[0:3])})
-
-                    if c_loss and a_loss:
-                        writer.add_scalars(loss_tag, global_step=episode,
-                                           tag_scalar_dict={'actor': a_loss, 'critic': c_loss})
-
-                    if c_loss and a_loss:
-                        print(
-                            f'\t\t\t\ta_loss {a_loss:.3f} c_loss {c_loss:.3f}')
-
-                    history_reward.append(np.sum(episode_reward[0:3]))
-                    history_a_loss.append(a_loss/100)
-                    history_c_loss.append(c_loss/10)
-
-                    history_step_reward.append(total_step_reward/100)
-                    cross_loss_curve(history_reward, history_a_loss,
-                                     history_c_loss, history_step_reward)
-                    wandb.log({"a_loss": a_loss, "c_loss": c_loss,
-                               "reward": np.sum(episode_reward[0:3]),
-                               "relative_reward": (np.sum(episode_reward[0:3])-np.sum(episode_reward[3:])), "total_step_reward": total_step_reward,
+                    wandb.log({"a_loss": a_loss, "c_loss": c_loss, "total_step_reward": total_step_reward,
                                })
 
-                if rank == 0 and len(history_success) >= 200 and sum(history_success[-200:]) > 110:
-                    print("-------------------------rank",
-                          rank, "----------------------------")
-                    print(
-                        "-------------------------Update Enemy!!!----------------------------")
-                    print("Success Rate",
-                          (sum(history_success[-200:])/200.0)*100, "%")
-                    gap = episode - episode_enemy_update
-                    if len(history_enemy) < 5 and (not select_pre):
-                        history_model = PPO(args, cpu_device)
-                        history_model.actor.load_state_dict(
-                            model_enemy.actor.state_dict())
-                        history_enemy[history_model] = gap
-                    else:
-                        if gap > min(history_enemy.values()) and (not select_pre):  # 只会有第一个
-                            del history_enemy[min(
-                                history_enemy, key=history_enemy.get)]
-                            history_model = PPO(args, cpu_device)
-                            history_model.actor.load_state_dict(
-                                model_enemy.actor.state_dict())
-                            history_enemy[history_model] = gap
-
-                    if np.random.uniform() >= 0.2:
-                        model_enemy.actor.load_state_dict(
-                            model.actor.state_dict())
-                        select_pre = False
-                    else:
-                        print("选个以前牛逼的!!!!!")
-                        niubi_enemy = random.sample(history_enemy.keys(), 1)[0]
-                        model_enemy.actor.load_state_dict(
-                            niubi_enemy.actor.state_dict())
-                        select_pre = True
-
-                    shared_lock.acquire()
-                    #torch.save(model_enemy.actor.state_dict(), model_enemy_path)
-                    shared_lock.release()
-
-                    episode_enemy_update = episode
-                    history_success = []
+                    #暂不用自博弈
+                    # if len(history_success) >= 200 and sum(history_success[-200:]) > 110:
+                    #     episode_enemy_update, select_pre = self_playing_update(model_enemy, model_enemy_path, model, shared_lock, 
+                    #                                                             args, episode, episode_enemy_update,
+                    #                                                             history_enemy, history_success, select_pre)
+                    #     history_success = []
 
                 total_step_reward = 0
                 memory.clear_memory()
                 memory_enemy.clear_memory()
                 env.reset()
-                step_reward = [0, 0, 0]
+                step_reward = 0
                 break
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--game_name', default="snakes_3v3", type=str)
+    parser.add_argument('--game_name', default="olympics-curling", type=str)
     parser.add_argument('--algo', default="ddpg", type=str, help="bicnet/ddpg")
     parser.add_argument('--max_episodes', default=500000, type=int)  # 50000
     parser.add_argument('--episode_length', default=200, type=int)
-    parser.add_argument('--output_activation',
-                        default="softmax", type=str, help="tanh/softmax")
 
-    parser.add_argument('--tau', default=0.01, type=float)  # 0.005
     parser.add_argument('--gamma', default=0.99, type=float)  # 0.95
     parser.add_argument('--seed', default=1, type=int)
     parser.add_argument('--a_lr', default=0.0003, type=float)  # 0.0001
-    parser.add_argument('--c_lr', default=0.0001, type=float)  # 0.0003
-    parser.add_argument('--batch_size', default=512,
-                        type=int)  # 32768  16384 8192 4096
-    parser.add_argument('--epsilon', default=0.5, type=float)
-    parser.add_argument('--epsilon_speed', default=0.993,
-                        type=float)  # 0.99998
-
+    
+    parser.add_argument('--controlled_player', default=1, help="0(agent purple) or 1(agent green)")
+    parser.add_argument('--render', action='store_true')
     parser.add_argument("--save_interval", default=20, type=int)  # 1000
     parser.add_argument("--model_episode", default=0, type=int)
     parser.add_argument(
         '--log_dir', default=datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
 
     # PPO
-    parser.add_argument('--eval', type=bool, default=True,
-                        help='Evaluates a policy a policy every 10 episode (default: True)')
-
     parser.add_argument("--load_model", action='store_true')  # 加是true；不加为false
     parser.add_argument("--load_model_run", default=1, type=int)
     parser.add_argument("--load_model_run_episode", default=4000, type=int)
+    parser.add_argument("--K_epochs", default=4, type=int)
 
     # Multiprocessing
-    parser.add_argument('--processes', default=10, type=int,
+    parser.add_argument('--processes', default=12, type=int,
                         help='number of processes to train with')
 
     args = parser.parse_args()
@@ -382,12 +308,13 @@ if __name__ == '__main__':
     manager = MyManager()
     manager.start()
 
+
     main_device = torch.device(
         "cuda:2") if torch.cuda.is_available() else torch.device("cpu")
     model_share = manager.PPO_Copy(args, main_device)
 
     # 定义保存路径
-    model_enemy_path = "/home/j-zhong/work_place/TD3_SAC_PPO_multi_Python/rl_trainer/models/snakes_3v3/run5/trained_model/enemy.pth"
+    model_enemy_path = "/home/j-zhong/work_place/Competition_Olympics-Curling-main/rl_trainer/models/snakes_3v3/run1/trained_model/enemy.pth"
     run_dir, log_dir = make_logpath(args.game_name, args.algo)
     if args.load_model:  # False:#True:#
         load_dir = os.path.join(os.path.dirname(
@@ -404,10 +331,11 @@ if __name__ == '__main__':
     shared_grad_buffer = Shared_grad_buffers(model_share.get_actor(), main_device)
 
     processes = []
-    K_epochs = 4
+    K_epochs = args.K_epochs
 
     for rank in range(args.processes):  # rank 编号
         if rank < args.processes*0.4 or rank==0:
+            print("start", rank)
             p = mp.Process(target=train, args=(rank, args, main_device, main_device, log_dir, run_dir, shared_lock, shared_count,
                                                event, model_enemy_path, model_share, experiment_share_1, K_epochs, shared_grad_buffer))
         else:
@@ -418,9 +346,5 @@ if __name__ == '__main__':
 
         p.start()
         processes.append(p)
-    for p in processes:
+    for p in processes: 
         p.join()
-
-
-# print("---run_dir",run_dir)
-# model_share.save_model(run_dir, 0)
