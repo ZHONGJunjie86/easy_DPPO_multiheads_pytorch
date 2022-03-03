@@ -1,3 +1,4 @@
+from cProfile import run
 import random
 from re import M
 import sys
@@ -55,9 +56,9 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
 
     history_success = []
     history_enemy = {}
-    RENDER = args.render #True#
+    RENDER = True#args.render #
 
-    total_step_reward = 0
+    total_step_reward = [0,0]
     c_loss, a_loss = 0, 0
     step_reward = 0
 
@@ -65,10 +66,14 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
     memory_enemy = Memory()
 
 
+    count_down = 100
     episode = 0
     episode_enemy_update = 0
     success = 0
     select_pre = False
+    distance_dict = {"our_turn":dict(),"enemy":dict()}
+    pre_ball_nums = 0
+
     
     record_win = deque(maxlen=100)
     record_win_op = deque(maxlen=100)
@@ -83,11 +88,10 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
 
     while episode < args.max_episodes:
 
-        episode += 1
         step = 0
         Gt = 0
         state = env.reset()
-        if RENDER and rank == 0:
+        if RENDER and rank == 0 and episode % 10 == 0:
             env.env_core.render()
 
         obs = np.array(state[ctrl_agent_index]['obs'])/10
@@ -107,6 +111,7 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
         else:obs = np.stack(memory_enemy.m_obs)
 
         while True:
+            pre_ball_nums = sum(state[ctrl_agent_index]["throws left"])
             if np.sum(np.array(state[ctrl_agent_index]['obs'])/10) != -90:
                 our_turn = True
             else: our_turn = False
@@ -135,6 +140,7 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
             #     print("our_turn",our_turn,"action--------",action)
             ################################# env rollout ##########################################
             #self.all_observes, reward, self.done, info_before, info_after
+            positions = env.env_core.agent_pos
             next_state, reward, done, _, info = env.step(action)
 
             next_obs = np.array(next_state[ctrl_agent_index]['obs'])/10
@@ -153,7 +159,7 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
                 else:
                     del memory.m_obs_next[:1]
                     memory.m_obs_next.append(next_obs)
-                our_turn = True
+                    
                 next_obs = np.stack(memory.m_obs_next)
 
             if np.sum(next_obs_enemy) != -90:
@@ -169,7 +175,6 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
                     del memory_enemy.m_obs_next[:1]
                     memory_enemy.m_obs_next.append(next_obs_enemy)
 
-                our_turn = False
                 next_obs = np.stack(memory_enemy.m_obs_next)
             
             
@@ -178,10 +183,12 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
             # ================================== reward shaping ========================================
             #done reward [0.0, 100.0]   post_reward[-100.0, 100.0]           
             #reward投完暂胜1 一局完10.0 结束100
-            #350.0 距离开始，靠近环90左右
+            #350.0 距离开始，靠近环90左右,left and right nodes of red line is 200
 
-            #距离奖励
-            step_reward = max( 130 - compute_distance([300, 500], env.env_core.agent_pos[-1]), -20)/1000
+            step_reward = compute_reward(state, ctrl_agent_index, positions,  distance_dict, our_turn, count_down, step_reward)
+
+            count_down -= 1
+
             if our_turn:
                 reward_index = 0
             else:
@@ -189,16 +196,22 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
             
             model.memory_our_enemy[reward_index].rewards.append(step_reward)
             #只看距离感觉奖励
-            total_step_reward += step_reward
+            total_step_reward[reward_index] += step_reward
+            
             #投完奖励
-            if sum(reward) == 1 or sum(reward) == 10:
+            if sum(reward) == 1 or sum(reward) == 10 or sum(reward) == 100:
+                if sum(reward) == 100:
+                    reward[reward.index(100)] = 10
                 winner_index = reward.index(1) if sum(reward) == 1 else reward.index(10) 
                 # our index 1
-                model.memory_our_enemy[1-winner_index].rewards[-1] += 1
                 if len(model.memory_our_enemy[winner_index].rewards) != 0:
-                    model.memory_our_enemy[winner_index].rewards[-1] -= 0.5
+                    model.memory_our_enemy[1-winner_index].rewards[-1] +=  0#max (0.5 * sum(reward) ,2)
+                    total_step_reward[1-winner_index] +=  0#max (0.5 * sum(reward) ,2)
+                    model.memory_our_enemy[winner_index].rewards[-1] -=  0#max (0.5 * sum(reward) ,2)
+                    total_step_reward[winner_index] -=  0#max (0.5 * sum(reward) ,2)
 
                 model.memory_our_enemy[reward_index].is_terminals.append(0)
+                count_down = 100
             else: model.memory_our_enemy[reward_index].is_terminals.append(0)
 
             #球投完
@@ -209,7 +222,7 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
             #         post_reward=[-1., -1.]
             
 
-            if RENDER and rank == 0:
+            if RENDER and rank == 0 and episode % 10 == 0:
                 env.env_core.render()
             #?
             Gt += reward[ctrl_agent_index] if done else 0
@@ -220,7 +233,8 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
             obs = next_obs
             #obs_enemy = next_obs_enemy
             
-            if sum(reward) == 10 or done:#done:
+            if sum(reward) == 10 or done or sum(reward) == 100 or pre_ball_nums<sum(next_state[ctrl_agent_index]["throws left"]):
+                distance_dict = {"our_turn":dict(),"enemy":dict()}
                 model.memory_our_enemy[0].is_terminals.append(1)
                 model.memory_our_enemy[1].is_terminals.append(1)
                 
@@ -251,7 +265,9 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
                 history_success.append(success)
 
                 if rank == 0:
-                    wandb.log({"a_loss": a_loss, "c_loss": c_loss, "total_step_reward": total_step_reward,
+                    wandb.log({"a_loss": a_loss, "c_loss": c_loss, 
+                    "total_step_reward_0": total_step_reward[0],
+                    "total_step_reward_1": total_step_reward[1],
                                })
 
                     #暂不用自博弈
@@ -261,11 +277,13 @@ def train(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared
                     #                                                             history_enemy, history_success, select_pre)
                     #     history_success = []
 
-                total_step_reward = 0
+                total_step_reward = [0, 0]
                 memory.clear_memory()
                 memory_enemy.clear_memory()
                 env.reset()
                 step_reward = 0
+                count_down = 100
+                episode += 1
                 break
 
 
@@ -289,12 +307,12 @@ if __name__ == '__main__':
 
     # PPO
     parser.add_argument("--load_model", action='store_true')  # 加是true；不加为false
-    parser.add_argument("--load_model_run", default=1, type=int)
+    parser.add_argument("--load_model_run", default=4, type=int)
     parser.add_argument("--load_model_run_episode", default=4000, type=int)
     parser.add_argument("--K_epochs", default=4, type=int)
 
     # Multiprocessing
-    parser.add_argument('--processes', default=12, type=int,
+    parser.add_argument('--processes', default=10, type=int,
                         help='number of processes to train with')
 
     args = parser.parse_args()
@@ -310,16 +328,19 @@ if __name__ == '__main__':
 
 
     main_device = torch.device(
-        "cuda:2") if torch.cuda.is_available() else torch.device("cpu")
+        "cuda:1") if torch.cuda.is_available() else torch.device("cpu")
     model_share = manager.PPO_Copy(args, main_device)
 
     # 定义保存路径
-    model_enemy_path = "/home/j-zhong/work_place/Competition_Olympics-Curling-main/rl_trainer/models/snakes_3v3/run1/trained_model/enemy.pth"
+    #/home/j-zhong/work_place/Competition_Olympics-Curling-main/rl_trainer/models/olympics-curling/run1/trained_model/actor_.pth
+    model_enemy_path = "/home/j-zhong/work_place/Competition_Olympics-Curling-main/rl_trainer/models/snakes_3v3/run6/trained_model/enemy.pth"
     run_dir, log_dir = make_logpath(args.game_name, args.algo)
-    if args.load_model:  # False:#True:#
+    print("run_dir-----------------------------",run_dir)
+    if False:#True:#args.load_model:  # 
         load_dir = os.path.join(os.path.dirname(
             run_dir), "run" + str(args.load_model_run))
         model_share.load_model(load_dir, episode=args.load_model_run_episode)
+    model_share.save_model(run_dir, 0)
 
     shared_lock = mp.Manager().Lock()
     event = mp.Event()
@@ -340,7 +361,7 @@ if __name__ == '__main__':
                                                event, model_enemy_path, model_share, experiment_share_1, K_epochs, shared_grad_buffer))
         else:
             device = torch.device(
-                "cuda:3") if torch.cuda.is_available() else torch.device("cpu")
+                "cuda:0") if torch.cuda.is_available() else torch.device("cpu")
             p = mp.Process(target=train, args=(rank, args, device, main_device, log_dir, run_dir, shared_lock, shared_count,
                                                event, model_enemy_path, model_share, experiment_share_1, K_epochs, shared_grad_buffer))
 

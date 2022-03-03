@@ -24,6 +24,56 @@ def compute_distance(p1, p2):
     dy = p1[1] - p2[1]
     return math.sqrt(dx**2 + dy**2)
 
+def compute_group_distance(origin, group_dict, positions):
+    distance = 0
+    for ball_dis_index in group_dict.keys():
+        if group_dict[ball_dis_index] != None:
+            dx = origin[0] - positions[group_dict[ball_dis_index]][0]
+            dy = origin[1] - positions[group_dict[ball_dis_index]][1]
+            distance += math.sqrt(dx**2 + dy**2)
+        else:
+            distance += 200
+    return distance
+
+def compute_reward(state, ctrl_agent_index, positions,  distance_dict, our_turn, count_down, step_reward):
+    
+    #距离奖励
+    if state[ctrl_agent_index]['release']:
+        if len(positions) == 1 and sum(positions[0])==450:
+            return step_reward
+        if our_turn:
+            distance_dict["our_turn"][sum(state[ctrl_agent_index]["throws left"])] \
+                                = len(positions)-1
+            
+            #对方有球在场上
+            if len(distance_dict["enemy"]) != 0:
+                step_reward = (compute_group_distance([300, 500], distance_dict["enemy"], positions)/len(distance_dict["enemy"])
+                                - compute_group_distance([300, 500], distance_dict["our_turn"], positions)/len(distance_dict["our_turn"]))/1000
+            else: step_reward = (125 - compute_distance([300, 500], positions[-1]))/1000
+        else:
+            distance_dict["enemy"][sum(state[ctrl_agent_index]["throws left"])] \
+                                = len(positions)-1
+            #对方有球在场上
+            if len(distance_dict["our_turn"]) != 0:
+                step_reward = (compute_group_distance([300, 500], distance_dict["our_turn"], positions) /len(distance_dict["our_turn"])
+                                - compute_group_distance([300, 500], distance_dict["enemy"], positions)/len(distance_dict["enemy"]))/1000
+            else: step_reward = (125 - compute_distance([300, 500], positions[-1]))/1000
+        
+    else:
+        step_reward = 0
+        if count_down < 50:
+            step_reward = -0.02
+        if our_turn:
+            distance_dict["our_turn"][sum(state[ctrl_agent_index]["throws left"])] = None
+        else:
+            distance_dict["enemy"][sum(state[ctrl_agent_index]["throws left"])] = None
+
+    return step_reward
+
+
+
+
+
 #[Box(-100.0, 200.0, (1,), float32), Box(-30.0, 30.0, (1,), float32)]
 actions_map = {0: [-100, -30], 1: [-100, -18], 2: [-100, -6], 3: [-100, 6], 4: [-100, 18], 5: [-100, 30], 6: [-40, -30],
                7: [-40, -18], 8: [-40, -6], 9: [-40, 6], 10: [-40, 18], 11: [-40, 30], 12: [20, -30], 13: [20, -18],
